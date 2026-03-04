@@ -1,0 +1,21 @@
+{
+    "name": "PurrFlux.Editor",
+    "rootNamespace": "",
+    "references": [
+        "GUID:400c15138a58bd34698e49dbee623253",
+        "GUID:deccb46461c684b399bd2ef983966192",
+        "GUID:8758ef92bf8f9415f8109664cfbbb0f7",
+        "GUID:629ad64ea20117f43b28b33033f75b88"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

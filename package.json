@@ -1,0 +1,31 @@
+{
+  "name": "com.xavierarpa.purrflux",
+  "displayName": "PurrFlux",
+  "version": "1.0.0",
+  "author": "Xavier Arpa",
+  "unity": "2022.3",
+  "documentation": "README.md",
+  "description": "Networked event system built on top of PurrNet and UniFlux. Publish and subscribe to topics across the network using string-key patterns with automatic serialization.",
+  "keywords": [
+    "flux",
+    "networking",
+    "purrnet",
+    "uniflux",
+    "events",
+    "multiplayer",
+    "unity"
+  ],
+  "dependencies": {
+    "com.xavierarpa.uniflux": "2.2.1"
+  },
+  "license": "MIT",
+  "category": "Networking",
+  "repository": {
+    "url": "https://github.com/xavierarpa/PurrFlux.git",
+    "type": "git"
+  },
+  "bugs": {
+    "url": "https://github.com/xavierarpa/PurrFlux/issues"
+  },
+  "homepage": "https://github.com/xavierarpa/PurrFlux#readme"
+}
