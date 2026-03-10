@@ -30,13 +30,35 @@ using UnityEngine;
 
 namespace PurrFlux
 {
+
+    /// <summary>
+    /// Cuatro formas de suscripción soportadas:
+    ///
+    /// 1) Action (sin payload ni sender):
+    ///    "myTopic".StoreNet(MyHandler, true);
+    ///    void MyHandler() { }
+    ///
+    /// 2) Action&lt;T&gt; (payload tipado, sin sender):
+    ///    "myTopic".StoreNet&lt;string&gt;(MyHandler, true);
+    ///    void MyHandler(string data) { }
+    ///
+    /// 3) Action&lt;PlayerID&gt; (solo sender, sin payload):
+    ///    "myTopic".StoreNet(MyHandler, true);
+    ///    void MyHandler(PlayerID sender) { }
+    ///
+    /// 4) Action&lt;PlayerID, T&gt; (sender + payload tipado):
+    ///    "myTopic".StoreNet&lt;string&gt;(MyHandler, true);
+    ///    void MyHandler(PlayerID sender, string data) { }
+    ///
+    /// Con atributo [MethodPurrFlux("myTopic")] las cuatro formas se detectan automáticamente.
+    /// </summary>
     public static class PurrFluxUtils
     {
         private static bool isSusbscribed = false;
-        private static readonly Dictionary<string, List<Action<byte[]>>> listeners = new();
-        private static readonly Dictionary<object, Action<byte[]>> wrappedHandlers = new();
+        private static readonly Dictionary<string, List<Action<PlayerID, byte[]>>> listeners = new();
+        private static readonly Dictionary<object, Action<PlayerID, byte[]>> wrappedHandlers = new();
         private static readonly BindingFlags allBindingFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-        private static readonly Dictionary<Type, List<(MethodInfo method, string topic, Type paramType)>> purrFluxMethodCache = new();
+        private static readonly Dictionary<Type, List<(MethodInfo method, string topic, Type paramType, bool hasSender)>> purrFluxMethodCache = new();
         private static readonly Dictionary<(object instance, MethodInfo method), Delegate> purrFluxDelegateCache = new();
         private static NetworkManager NetworkManager => NetworkManager.main;
 
@@ -50,13 +72,7 @@ namespace PurrFlux
         {
             void OnNetworkReceived(PlayerID sender, PurrMessage msg, bool asServer)
             {
-                Debug.Log($"[PurrFlux] (OnNetworkReceived) Received message on topic '{msg.topic}' from {sender} (asServer={asServer})");
-
-                if (asServer)
-                {
-                    NetworkManager.SendToAll(msg, Channel.ReliableOrdered);
-                }
-                else
+                void InvokeListeners()
                 {
                     if (listeners.TryGetValue(msg.topic, out var list))
                     {
@@ -64,7 +80,7 @@ namespace PurrFlux
                         {
                             try
                             {
-                                handler.Invoke(msg.payload);
+                                handler.Invoke(sender, msg.payload);
                             }
                             catch (Exception ex)
                             {
@@ -76,6 +92,25 @@ namespace PurrFlux
                     {
                         Debug.LogWarning($"[PurrFlux] No listeners for topic '{msg.topic}'");
                     }
+                }
+
+
+                // Debug.Log($"[PurrFlux] (OnNetworkReceived) Received message on topic '{msg.topic}' from {sender} (asServer={asServer}, serverOnly={msg.serverOnly})");
+
+                if (asServer)
+                {
+                    if (msg.serverOnly)
+                    {
+                        InvokeListeners();
+                    }
+                    else
+                    {
+                        NetworkManager.SendToAll(msg, Channel.ReliableOrdered);
+                    }
+                }
+                else
+                {
+                    InvokeListeners();
                 }
             }
 
@@ -127,12 +162,17 @@ namespace PurrFlux
         }
 
         /// <summary>
-        /// 
+        /// Publish an event with a typed payload to the network. If serverOnly is true, the message will only be sent to the server. If false, it will be sent to all clients (if called from server) or to the server (if called from client).
+        /// Listeners can check the sender and serverOnly flag to determine how to handle the message.
+        /// The payload is serialized using PurrNet's packing system, so it can be any type that Packer<T> supports.
+        /// The topic is a string that identifies the message type, and listeners can subscribe to specific topics.
         /// </summary>
         /// <param name="topic"></param>
         /// <param name="data"></param>
+        /// <param name="serverOnly"></param>
+        /// <param name="channel"></param>
         /// <typeparam name="T"></typeparam>
-        public static void DispatchNet<T>(this string topic, T data)
+        public static void DispatchNet<T>(this string topic, T data, bool serverOnly, Channel channel = Channel.ReliableOrdered)
         {
             void Send(string topic, byte[] payload)
             {
@@ -148,17 +188,22 @@ namespace PurrFlux
                     return;
                 }
 
-                var message = new PurrMessage(topic, payload);
+                var message = new PurrMessage(topic, payload, serverOnly);
 
-                if (NetworkManager.isServer)
+                if(serverOnly)
                 {
-                    Debug.Log($"[PurrFlux] Publish Send To All Clients. topic:'{message.topic}'");
-                    NetworkManager.SendToAll(message, Channel.ReliableOrdered);
+                    NetworkManager.SendToServer(message, channel);
                 }
                 else
                 {
-                    Debug.Log($"[PurrFlux] Publish Send To Server. topic:'{message.topic}'");
-                    NetworkManager.SendToServer(message, Channel.ReliableOrdered);
+                    if (NetworkManager.isServer)
+                    {
+                        NetworkManager.SendToAll(message, channel);
+                    }
+                    else
+                    {
+                        NetworkManager.SendToServer(message, channel);
+                    }
                 }
             }
             
@@ -178,9 +223,9 @@ namespace PurrFlux
         /// <summary>
         /// Publish an event with no payload (Action-style).
         /// </summary>
-        public static void DispatchNet(this string topic)
+        public static void DispatchNet(this string topic, bool serverOnly, Channel channel = Channel.ReliableOrdered)
         {
-            topic.DispatchNet<byte>(0);
+            topic.DispatchNet<byte>(0, serverOnly, channel);
         }
 
         /// <summary>
@@ -188,16 +233,16 @@ namespace PurrFlux
         /// </summary>
         private static void Listen(string topic, Action handler)
         {
-            void HandlerWrapper(byte[] payload)
+            void HandlerWrapper(PlayerID sender, byte[] payload)
             {
                 handler.Invoke();
             }
 
-            void ListenTopic(string topic, Action<byte[]> handler)
+            void ListenTopic(string topic, Action<PlayerID, byte[]> handler)
             {
                 if (!listeners.TryGetValue(topic, out var list))
                 {
-                    list = new List<Action<byte[]>>();
+                    list = new List<Action<PlayerID, byte[]>>();
                     listeners[topic] = list;
                 }
 
@@ -215,6 +260,54 @@ namespace PurrFlux
         /// Unlisten a topic with no payload (Action-style).
         /// </summary>
         private static void Unlisten(string topic, Action handler)
+        {
+            if (wrappedHandlers.TryGetValue(handler, out var wrapper))
+            {
+                if (listeners.TryGetValue(topic, out var list))
+                {
+                    list.Remove(wrapper);
+                    if (list.Count == 0)
+                    {
+                        listeners.Remove(topic);
+                    }
+                }
+
+                wrappedHandlers.Remove(handler);
+            }
+        }
+
+        /// <summary>
+        /// Listen for a topic with sender only, no payload (Action&lt;PlayerID&gt;-style).
+        /// </summary>
+        private static void Listen(string topic, Action<PlayerID> handler)
+        {
+            void HandlerWrapper(PlayerID sender, byte[] payload)
+            {
+                handler.Invoke(sender);
+            }
+
+            void ListenTopic(string topic, Action<PlayerID, byte[]> handler)
+            {
+                if (!listeners.TryGetValue(topic, out var list))
+                {
+                    list = new List<Action<PlayerID, byte[]>>();
+                    listeners[topic] = list;
+                }
+
+                if (!list.Contains(handler))
+                {
+                    list.Add(handler);
+                }
+            }
+
+            wrappedHandlers[handler] = HandlerWrapper;
+            ListenTopic(topic, wrappedHandlers[handler]);
+        }
+
+        /// <summary>
+        /// Unlisten a topic with sender only, no payload (Action&lt;PlayerID&gt;-style).
+        /// </summary>
+        private static void Unlisten(string topic, Action<PlayerID> handler)
         {
             if (wrappedHandlers.TryGetValue(handler, out var wrapper))
             {
@@ -261,16 +354,16 @@ namespace PurrFlux
                 using var stream = BitPackerPool.Get(payload);
                 return Packer<T>.Read(stream);
             }
-            void HandlerWrapper(byte[] payload)
+            void HandlerWrapper(PlayerID sender, byte[] payload)
             {
                 handler.Invoke(Deserialize(payload));
             }
             
-            void ListenTopic(string topic, Action<byte[]> handler)
+            void ListenTopic(string topic, Action<PlayerID, byte[]> handler)
             {
                 if (!listeners.TryGetValue(topic, out var list))
                 {
-                    list = new List<Action<byte[]>>();
+                    list = new List<Action<PlayerID, byte[]>>();
                     listeners[topic] = list;
                 }
 
@@ -284,12 +377,78 @@ namespace PurrFlux
             ListenTopic(topic, wrappedHandlers[handler]);
         }
 
+        /// <summary>
+        /// Listen for a topic with typed payload and sender info.
+        /// </summary>
+        private static void Listen<T>(string topic, Action<PlayerID, T> handler)
+        {
+            T Deserialize(byte[] payload)
+            {
+                using var stream = BitPackerPool.Get(payload);
+                return Packer<T>.Read(stream);
+            }
+            void HandlerWrapper(PlayerID sender, byte[] payload)
+            {
+                handler.Invoke(sender, Deserialize(payload));
+            }
+            
+            void ListenTopic(string topic, Action<PlayerID, byte[]> handler)
+            {
+                if (!listeners.TryGetValue(topic, out var list))
+                {
+                    list = new List<Action<PlayerID, byte[]>>();
+                    listeners[topic] = list;
+                }
 
+                if (!list.Contains(handler))
+                {
+                    list.Add(handler);
+                }
+            }
+
+            wrappedHandlers[handler] = HandlerWrapper;
+            ListenTopic(topic, wrappedHandlers[handler]);
+        }
+
+        /// <summary>
+        /// Unlisten a topic with typed payload and sender info.
+        /// </summary>
+        private static void Unlisten<T>(string topic, Action<PlayerID, T> handler)
+        {
+            if (wrappedHandlers.TryGetValue(handler, out var wrapper))
+            {
+                if (listeners.TryGetValue(topic, out var list))
+                {
+                    list.Remove(wrapper);
+                    if (list.Count == 0)
+                    {
+                        listeners.Remove(topic);
+                    }
+                }
+
+                wrappedHandlers.Remove(handler);
+            }
+        }
 
         /// <summary>
         /// Subscribe/unsubscribe a parameterless Action to a topic.
         /// </summary>
         public static void StoreNet(this string topic, Action handler, bool condition)
+        {
+            if (condition)
+            {
+                Listen(topic, handler);
+            }
+            else
+            {
+                Unlisten(topic, handler);
+            }
+        }
+
+        /// <summary>
+        /// Subscribe/unsubscribe an Action&lt;PlayerID&gt; to a topic (sender only, no payload).
+        /// </summary>
+        public static void StoreNet(this string topic, Action<PlayerID> handler, bool condition)
         {
             if (condition)
             {
@@ -317,6 +476,21 @@ namespace PurrFlux
         }
 
         /// <summary>
+        /// Subscribe/unsubscribe a typed Action&lt;PlayerID, T&gt; to a topic (includes sender info).
+        /// </summary>
+        public static void StoreNet<T>(this string topic, Action<PlayerID, T> handler, bool condition)
+        {
+            if (condition)
+            {
+                Listen(topic, handler);
+            }
+            else
+            {
+                Unlisten(topic, handler);
+            }
+        }
+
+        /// <summary>
         /// Descubre métodos marcados con [MethodPurrFlux] y los suscribe/desuscribe
         /// como listeners de red. Al recibir datos, el HandlerWrapper de Listen
         /// hace Dispatch para que UniFlux entregue a los métodos atribuidos.
@@ -327,7 +501,7 @@ namespace PurrFlux
 
             if (!purrFluxMethodCache.TryGetValue(type, out var methodList))
             {
-                methodList = new List<(MethodInfo, string, Type)>();
+                methodList = new List<(MethodInfo, string, Type, bool)>();
                 var methods = type.GetMethods(allBindingFlags);
 
                 for (int i = 0; i < methods.Length; i++)
@@ -341,9 +515,38 @@ namespace PurrFlux
 
                     var parameters = methods[i].GetParameters();
 
-                    if (parameters.Length > 1 || methods[i].ReturnType != typeof(void))
+                    if (methods[i].ReturnType != typeof(void))
                     {
-                        Debug.LogError($"[PurrFlux] '{methods[i].Name}' must have 0 or 1 parameters and return void.");
+                        Debug.LogError($"[PurrFlux] '{methods[i].Name}' must return void.");
+                        continue;
+                    }
+
+                    bool hasSender = false;
+                    Type paramType = null;
+
+                    if (parameters.Length == 0)
+                    {
+                        // Action
+                    }
+                    else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(PlayerID))
+                    {
+                        // Action<PlayerID> (sender only)
+                        hasSender = true;
+                    }
+                    else if (parameters.Length == 1)
+                    {
+                        // Action<T>
+                        paramType = parameters[0].ParameterType;
+                    }
+                    else if (parameters.Length == 2 && parameters[0].ParameterType == typeof(PlayerID))
+                    {
+                        // Action<PlayerID, T>
+                        hasSender = true;
+                        paramType = parameters[1].ParameterType;
+                    }
+                    else
+                    {
+                        Debug.LogError($"[PurrFlux] '{methods[i].Name}' must have 0-1 params, or 2 params with PlayerID as first.");
                         continue;
                     }
 
@@ -353,8 +556,7 @@ namespace PurrFlux
                         continue;
                     }
 
-                    var paramType = parameters.Length == 1 ? parameters[0].ParameterType : null;
-                    methodList.Add((methods[i], topic, paramType));
+                    methodList.Add((methods[i], topic, paramType, hasSender));
                 }
 
                 purrFluxMethodCache[type] = methodList;
@@ -362,12 +564,21 @@ namespace PurrFlux
 
             for (int i = 0; i < methodList.Count; i++)
             {
-                var (method, topic, paramType) = methodList[i];
+                var (method, topic, paramType, hasSender) = methodList[i];
                 var delegateKey = (obj, method);
 
                 if (!purrFluxDelegateCache.TryGetValue(delegateKey, out var del))
                 {
-                    if (paramType != null)
+                    if (hasSender && paramType != null)
+                    {
+                        var actionType = typeof(Action<,>).MakeGenericType(typeof(PlayerID), paramType);
+                        del = Delegate.CreateDelegate(actionType, obj, method);
+                    }
+                    else if (hasSender)
+                    {
+                        del = Delegate.CreateDelegate(typeof(Action<PlayerID>), obj, method);
+                    }
+                    else if (paramType != null)
                     {
                         var actionType = typeof(Action<>).MakeGenericType(paramType);
                         del = Delegate.CreateDelegate(actionType, obj, method);
@@ -380,10 +591,25 @@ namespace PurrFlux
                     purrFluxDelegateCache[delegateKey] = del;
                 }
 
-                if (paramType != null)
+                if (hasSender && paramType != null)
                 {
                     var storeMethod = typeof(PurrFluxUtils).GetMethods(BindingFlags.Public | BindingFlags.Static)
-                        .First(m => m.Name == nameof(StoreNet) && m.IsGenericMethodDefinition)
+                        .First(m => m.Name == nameof(StoreNet) && m.IsGenericMethodDefinition
+                            && m.GetParameters()[1].ParameterType.IsGenericType
+                            && m.GetParameters()[1].ParameterType.GetGenericTypeDefinition() == typeof(Action<,>))
+                        .MakeGenericMethod(paramType);
+                    storeMethod.Invoke(null, new object[] { topic, del, condition });
+                }
+                else if (hasSender)
+                {
+                    StoreNet(topic, (Action<PlayerID>)del, condition);
+                }
+                else if (paramType != null)
+                {
+                    var storeMethod = typeof(PurrFluxUtils).GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .First(m => m.Name == nameof(StoreNet) && m.IsGenericMethodDefinition
+                            && m.GetParameters()[1].ParameterType.IsGenericType
+                            && m.GetParameters()[1].ParameterType.GetGenericTypeDefinition() == typeof(Action<>))
                         .MakeGenericMethod(paramType);
                     storeMethod.Invoke(null, new object[] { topic, del, condition });
                 }

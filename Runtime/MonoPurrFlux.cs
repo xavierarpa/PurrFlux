@@ -50,8 +50,6 @@ namespace PurrFlux
             /// Subscribe or unsubscribe from flux state updates for methods marked with [MethodPurrFlux] attribute
             PurrFluxUtils.SubscribeAttributes(this, condition);
 
-            // GiveOwnership(localPlayer);
-
             // Call OnFlux method with the new subscription state
             OnFlux(in condition);
         }
