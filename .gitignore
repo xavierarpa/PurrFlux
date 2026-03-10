@@ -1,0 +1,26 @@
+# Unity meta files outside of Runtime/Editor are managed by the host project
+# but we DO want to keep .meta files for Runtime/ and Editor/ so UPM works correctly
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vs/
+*.sln
+*.csproj
+*.suo
+*.user
+
+# Unity Library (if someone opens this as a project)
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/
+
+# Unity meta files at root level (only needed inside the Unity project, not the standalone repo)
+/*.meta
