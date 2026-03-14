@@ -1,6 +1,6 @@
 # PurrFlux
 
-Networked event system built on top of **PurrNet** and **UniFlux**. Lets you publish and subscribe to topics across the network using the same string-key pattern as UniFlux, but messages are automatically serialized, sent through PurrNet, and dispatched to all connected clients.
+Networked event system built on top of **PurrNet** and **UniFlux**. Lets you publish and subscribe to topics across the network using the same string-key pattern as UniFlux, but messages are automatically serialized, sent through PurrNet, and dispatched to connected clients.
 
 ## Requirements
 
@@ -11,42 +11,57 @@ Networked event system built on top of **PurrNet** and **UniFlux**. Lets you pub
 ## Architecture
 
 ```
-Publisher ──DispatchNet──► PurrFluxUtils ──PurrNet──► Server ──Broadcast──► All Clients
-                                                                              │
-                                                                listeners dict / Deserialize
-                                                                              │
-                                                                        ◄── Handlers
+Publisher ──DispatchNet──► PurrFluxUtils ──PurrNet──► Server ──┬── serverOnly=true  → Invoke on server only
+                                                               └── serverOnly=false → Broadcast to all clients
+                                                                                          │
+                                                                                 listeners dict / Deserialize
+                                                                                          │
+                                                                                    ◄── Handlers(PlayerID sender, T data)
 ```
 
-- **Client publishes** → message is sent to server via PurrNet.
-- **Server receives** → rebroadcasts to all clients.
-- **Client receives** → looks up topic in listeners, deserializes payload, invokes handlers.
+- **Client publishes** → message is sent to server via PurrNet Broadcasts.
+- **Server receives** → if `serverOnly`, invokes listeners on the server; otherwise rebroadcasts to all clients.
+- **Receivers** → look up topic in listeners, deserialize payload, invoke handlers with `PlayerID sender` info.
 
 ## Quick Start
 
 ### 1. Manual subscription (`StoreNet`)
 
-Subscribe and unsubscribe to network topics directly, similar to UniFlux's `Store`.
+Subscribe and unsubscribe to network topics directly, similar to UniFlux's `Store`. Four handler signatures are supported:
 
 ```csharp
 using PurrFlux;
+using PurrNet;
 using UnityEngine;
 
 public class ChatListener : MonoBehaviour
 {
     private void OnEnable()
     {
-        // Typed topic (Action<T>)
+        // 1) Action — no payload, no sender
+        "chat/ping".StoreNet(OnPing, true);
+
+        // 2) Action<T> — typed payload, no sender
         "chat/message".StoreNet<string>(OnChatMessage, true);
 
-        // Parameterless topic (Action)
-        "chat/ping".StoreNet(OnPing, true);
+        // 3) Action<PlayerID> — sender only, no payload
+        "chat/ping".StoreNet<PlayerID>(OnPingFrom, true);
+
+        // 4) Action<PlayerID, T> — sender + typed payload
+        "chat/message".StoreNet<string>(OnChatMessageFrom, true);
     }
 
     private void OnDisable()
     {
-        "chat/message".StoreNet<string>(OnChatMessage, false);
         "chat/ping".StoreNet(OnPing, false);
+        "chat/message".StoreNet<string>(OnChatMessage, false);
+        "chat/ping".StoreNet<PlayerID>(OnPingFrom, false);
+        "chat/message".StoreNet<string>(OnChatMessageFrom, false);
+    }
+
+    private void OnPing()
+    {
+        Debug.Log("Ping received!");
     }
 
     private void OnChatMessage(string message)
@@ -54,9 +69,14 @@ public class ChatListener : MonoBehaviour
         Debug.Log($"Chat: {message}");
     }
 
-    private void OnPing()
+    private void OnPingFrom(PlayerID sender)
     {
-        Debug.Log("Ping received!");
+        Debug.Log($"Ping from {sender}");
+    }
+
+    private void OnChatMessageFrom(PlayerID sender, string message)
+    {
+        Debug.Log($"Chat from {sender}: {message}");
     }
 }
 ```
@@ -65,22 +85,41 @@ public class ChatListener : MonoBehaviour
 
 Inherit from `MonoPurrFlux` to get automatic subscription lifecycle. Mark handler methods with `[MethodPurrFlux("topic")]` — they are discovered by reflection and subscribed on `OnEnable` / unsubscribed on `OnDisable`.
 
+All four handler signatures work with the attribute:
+
 ```csharp
 using PurrFlux;
+using PurrNet;
 using UnityEngine;
 
 public class LobbyHandler : MonoPurrFlux
 {
+    // Action — no params
+    [MethodPurrFlux("lobby/ready")]
+    private void OnAllReady()
+    {
+        Debug.Log("All players ready!");
+    }
+
+    // Action<T> — typed payload
     [MethodPurrFlux("lobby/join")]
     private void OnPlayerJoined(string playerName)
     {
         Debug.Log($"{playerName} joined the lobby");
     }
 
-    [MethodPurrFlux("lobby/ready")]
-    private void OnAllReady()
+    // Action<PlayerID> — sender only
+    [MethodPurrFlux("lobby/leave")]
+    private void OnPlayerLeft(PlayerID sender)
     {
-        Debug.Log("All players ready!");
+        Debug.Log($"Player {sender} left");
+    }
+
+    // Action<PlayerID, T> — sender + payload
+    [MethodPurrFlux("lobby/chat")]
+    private void OnLobbyChat(PlayerID sender, string message)
+    {
+        Debug.Log($"[{sender}]: {message}");
     }
 }
 ```
@@ -90,11 +129,20 @@ public class LobbyHandler : MonoPurrFlux
 ### 3. Publishing messages
 
 ```csharp
-// Send a typed message
-"chat/message".DispatchNet("Hello everyone!");
+// Broadcast a typed message to all clients (serverOnly: false)
+"chat/message".DispatchNet("Hello everyone!", serverOnly: false);
 
-// Send a parameterless event
-"lobby/ready".DispatchNet();
+// Send a typed message to the server only (serverOnly: true)
+"server/command".DispatchNet("restart", serverOnly: true);
+
+// Broadcast a parameterless event
+"lobby/ready".DispatchNet(serverOnly: false);
+
+// Send parameterless event to the server only
+"server/ping".DispatchNet(serverOnly: true);
+
+// Optionally specify the delivery channel (defaults to ReliableOrdered)
+"game/input".DispatchNet(inputData, serverOnly: true, Channel.UnreliableSequenced);
 ```
 
 ### 4. Mixing with UniFlux attributes
@@ -103,6 +151,7 @@ public class LobbyHandler : MonoPurrFlux
 
 ```csharp
 using PurrFlux;
+using PurrNet;
 using UniFlux;
 using UnityEngine;
 
@@ -115,11 +164,18 @@ public class HybridHandler : MonoPurrFlux
         Debug.Log("UI refreshed (local)");
     }
 
-    // Networked PurrFlux event
+    // Networked PurrFlux event (payload only)
     [MethodPurrFlux("game/score")]
     private void OnScoreUpdate(int newScore)
     {
         Debug.Log($"Score updated: {newScore} (from network)");
+    }
+
+    // Networked PurrFlux event (sender + payload)
+    [MethodPurrFlux("game/kill")]
+    private void OnKill(PlayerID sender, string victimName)
+    {
+        Debug.Log($"{sender} eliminated {victimName}");
     }
 }
 ```
@@ -157,10 +213,28 @@ public class PlayerState : MonoPurrFlux
     }
 
     [MethodPurrFlux("player/update")]
-    private void OnPlayerUpdate(string name)
+    private void OnPlayerUpdate(PlayerID sender, string name)
     {
+        Debug.Log($"Player update from {sender}");
         playerName.value = name;
     }
+}
+```
+
+### 6. Server-only messages
+
+Use `serverOnly: true` to send messages that the server processes without broadcasting to all clients. This is useful for client-to-server requests:
+
+```csharp
+// Client sends a request — only the server will invoke listeners
+"server/request-spawn".DispatchNet(spawnData, serverOnly: true);
+
+// On the server side, a listener handles the request
+[MethodPurrFlux("server/request-spawn")]
+private void OnSpawnRequest(PlayerID sender, SpawnData data)
+{
+    if (!isServer) return;
+    SpawnEntity(sender, data);
 }
 ```
 
@@ -170,10 +244,23 @@ public class PlayerState : MonoPurrFlux
 
 | Method | Description |
 |--------|-------------|
-| `"topic".DispatchNet<T>(T data)` | Sends a typed message to all clients via the server |
-| `"topic".DispatchNet()` | Sends a parameterless event |
-| `"topic".StoreNet<T>(Action<T>, bool)` | Subscribe (`true`) or unsubscribe (`false`) a typed handler |
-| `"topic".StoreNet(Action, bool)` | Subscribe/unsubscribe a parameterless handler |
+| `"topic".DispatchNet<T>(T data, bool serverOnly, Channel channel = ReliableOrdered)` | Sends a typed message. If `serverOnly`, only the server processes it; otherwise all clients receive it. |
+| `"topic".DispatchNet(bool serverOnly, Channel channel = ReliableOrdered)` | Sends a parameterless event with the same routing logic. |
+| `"topic".StoreNet(Action, bool)` | Subscribe/unsubscribe a parameterless handler (no sender, no payload). |
+| `"topic".StoreNet(Action<PlayerID>, bool)` | Subscribe/unsubscribe a sender-only handler (no payload). |
+| `"topic".StoreNet<T>(Action<T>, bool)` | Subscribe/unsubscribe a typed handler (payload, no sender). |
+| `"topic".StoreNet<T>(Action<PlayerID, T>, bool)` | Subscribe/unsubscribe a handler with sender + typed payload. |
+
+### Handler Signatures
+
+PurrFlux supports four handler forms, usable both with `StoreNet` and `[MethodPurrFlux]`:
+
+| Signature | Description |
+|-----------|-------------|
+| `void Handler()` | No payload, no sender info |
+| `void Handler(T data)` | Typed payload, no sender info |
+| `void Handler(PlayerID sender)` | Sender info only, no payload |
+| `void Handler(PlayerID sender, T data)` | Sender info + typed payload |
 
 ### Classes
 
@@ -182,6 +269,7 @@ public class PlayerState : MonoPurrFlux
 | `MonoPurrFlux` | Base class (`NetworkBehaviour`) with automatic attribute subscription lifecycle |
 | `MethodPurrFluxAttribute` | Marks a method for automatic networked subscription via topic key |
 | `PurrFluxUtils` | Static utility class that manages listeners, serialization, and network transport |
+| `PurrMessage` | Internal network message struct (`IPackedAuto`) with `topic`, `payload`, and `serverOnly` fields |
 
 ### Lifecycle (`MonoPurrFlux`)
 

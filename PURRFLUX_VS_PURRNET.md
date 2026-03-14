@@ -41,12 +41,18 @@ Servidor → NetworkManager.SendToAll(data) → Todos los clientes reciben
 ### PurrFlux (Topic-based Pub/Sub)
 
 ```
-Cualquiera → "topic".DispatchNet(data) → Servidor → Broadcast a todos → listeners[topic] invocan handlers
+Cualquiera → "topic".DispatchNet(data, serverOnly) → PurrNet → Server ─┬─ serverOnly=true  → Invoke on server
+                                                                        └─ serverOnly=false → Broadcast → All Clients
+                                                                                                              │
+                                                                                               listeners[topic](PlayerID sender, data)
 ```
 
 - Construido **encima de Broadcasts** de PurrNet
 - Topics son **strings** dinámicos (como `"chat/message"`, `"lobby/ready"`)
+- **Sender info incluida**: todos los handlers reciben `PlayerID sender` internamente
+- **Server-only routing**: con `serverOnly: true`, el mensaje solo se procesa en el servidor sin rebroadcast
 - Los handlers se registran con `[MethodPurrFlux("topic")]` (auto) o `"topic".StoreNet(handler, true)` (manual)
+- **Cuatro formas de handler**: `Action`, `Action<T>`, `Action<PlayerID>`, `Action<PlayerID, T>`
 - **Cualquier MonoPurrFlux puede escuchar cualquier topic** — no importa en qué GameObject esté
 
 ---
@@ -57,14 +63,16 @@ Cualquiera → "topic".DispatchNet(data) → Servidor → Broadcast a todos → 
 |---|---|---|---|
 | **Acoplamiento** | Fuerte: el caller debe tener referencia al script que tiene el RPC | Medio: necesita conocer el struct de datos | Débil: solo necesita conocer el string del topic |
 | **Requiere NetworkIdentity** | Sí (excepto Static RPC) | No | Sí (`MonoPurrFlux` hereda `NetworkBehaviour`) |
-| **Dirección** | Client→Server, Server→Clients, Server→Client | Client→Server, Server→Clients | Cualquiera→Todos (broadcast implícito) |
+| **Dirección** | Client→Server, Server→Clients, Server→Client | Client→Server, Server→Clients | Broadcast a todos **o** solo al servidor (`serverOnly`) |
+| **Sender info** | Sí (`RPCInfo info = default`) | Sí (`PlayerID sender`) | Sí (`PlayerID sender` en handlers) |
 | **Serialización** | Codegen automático en compilación | Manual (`IPackedAuto`) | Automática vía `Packer<T>` en runtime |
 | **Routing** | Directo al método específico | Por tipo de struct | Por string topic |
 | **Ownership** | Configurable (`RequireOwnership`) | No aplica | No tiene concepto de ownership |
 | **Awaitable** | Sí (`Task<T>`) | No | No |
-| **RPCInfo (sender)** | Sí | Sí (`PlayerID sender`) | No nativo |
+| **Server-only** | Implícito con `[ServerRpc]` | Manual (solo `SendToServer`) | Sí (`serverOnly: true`) |
 | **Performance** | Óptimo (codegen, sin reflection en runtime) | Óptimo | Reflection en suscripción + diccionario lookup |
 | **Compatibilidad UniFlux** | Ninguna | Ninguna | Total (comparte lifecycle con `[MethodFlux]`) |
+| **Channel configurable** | Sí | Sí | Sí (`Channel` param en `DispatchNet`) |
 
 ---
 
@@ -83,14 +91,14 @@ networkMessagingModule.ServerRpc_RequestAddPlayer(userId);
 **PurrFlux** solo necesita el topic:
 ```csharp
 // El caller NO necesita saber quién escucha
-"player/request-add".DispatchNet(userId);
+"player/request-add".DispatchNet(userId, serverOnly: true);
 ```
 
 **Escenario ideal**: Sistemas de chat, notificaciones globales, eventos de UI que cualquier módulo puede escuchar sin dependencias directas.
 
 ```csharp
-// En cualquier parte del juego (ni siquiera necesita ser NetworkBehaviour)
-"notification/achievement".DispatchNet("First Blood!");
+// En cualquier parte del juego
+"notification/achievement".DispatchNet("First Blood!", serverOnly: false);
 
 // En un módulo de UI completamente separado
 [MethodPurrFlux("notification/achievement")]
@@ -112,7 +120,7 @@ Con PurrFlux, **cualquier MonoPurrFlux en cualquier GameObject** puede escuchar 
 ```csharp
 // ScoreboardUI.cs
 [MethodPurrFlux("game/score-changed")]
-private void OnScoreChanged(int newScore) => UpdateScoreboard(newScore);
+private void OnScoreChanged(PlayerID sender, int newScore) => UpdateScoreboard(sender, newScore);
 
 // SoundManager.cs  
 [MethodPurrFlux("game/score-changed")]
@@ -157,9 +165,9 @@ public class BattleUI : MonoPurrFlux
     [MethodFlux("ui/refresh")]
     private void OnRefreshUI() => RefreshAllPanels();
 
-    // Evento de RED (llega de cualquier cliente via PurrFlux)
+    // Evento de RED (llega de cualquier cliente via PurrFlux, con sender info)
     [MethodPurrFlux("battle/phase-changed")]
-    private void OnPhaseChanged(int phase) => UpdatePhaseIndicator(phase);
+    private void OnPhaseChanged(PlayerID sender, int phase) => UpdatePhaseIndicator(phase);
 }
 ```
 
@@ -173,7 +181,7 @@ No necesitas dos sistemas mentales diferentes. Mismo paradigma de atributo + str
 
 ```csharp
 // Enviar un evento específico a un "canal" por equipo
-$"team/{teamId}/message".DispatchNet("Avancen!");
+$"team/{teamId}/message".DispatchNet("Avancen!", serverOnly: false);
 
 // Escuchar solo los mensajes de tu equipo
 $"team/{myTeamId}/message".StoreNet<string>(OnTeamMessage, true);
@@ -183,15 +191,26 @@ Con RPCs, el routing es estático (definido por el método y el script). No pued
 
 **Escenario ideal**: Sistemas de chat con canales, notificaciones por grupo/zona, telemetría filtrada por criterio.
 
-### 6. No Requiere Ownership ni Identity Directa del Publisher
+### 6. Server-Only Messaging
 
-**Qué es**: PurrFlux envía mensajes a través de `NetworkManager.SendToServer`/`SendToAll`, que no valida ownership.
+**Qué es**: Con `serverOnly: true`, el mensaje viaja Client→Server y **no** se rebroadcastea a los demás clientes. Los listeners solo se invocan en el servidor.
 
-Con `[ServerRpc]`, PurrNet puede validar que solo el **owner** del NetworkIdentity llame al RPC (a menos que uses `RequireOwnership = false`). Esto es seguridad, pero también es una limitación cuando quieres que **cualquier componente** de cualquier jugador publique.
+```csharp
+// Cliente envía un request solo al servidor
+"server/request-spawn".DispatchNet(spawnData, serverOnly: true);
 
-Con PurrFlux, `"topic".DispatchNet(data)` funciona desde cualquier contexto conectado a la red.
+// Solo el servidor ejecuta este handler
+[MethodPurrFlux("server/request-spawn")]
+private void OnSpawnRequest(PlayerID sender, SpawnData data)
+{
+    if (!isServer) return;
+    SpawnEntity(sender, data);
+}
+```
 
-**Escenario ideal**: Eventos donde el emisor no es relevante (telemetría, logs de red, sistemas de votación donde cualquier jugador vota).
+Esto cubre parte del caso de uso de `[ServerRpc]` cuando no necesitas ownership validation ni Awaitable responses.
+
+**Escenario ideal**: Requests unidireccionales Client→Server donde no importa el ownership y no se necesita respuesta tipada.
 
 ---
 
@@ -200,9 +219,8 @@ Con PurrFlux, `"topic".DispatchNet(data)` funciona desde cualquier contexto cone
 | Escenario | Por qué PurrNet nativo es mejor |
 |---|---|
 | **Request-Response** (cliente pide, servidor responde) | `[ServerRpc]` con Awaitable RPC (`Task<T>`) permite `await` del resultado. PurrFlux no tiene mecanismo de respuesta. |
-| **Necesitas saber quién envió** | `RPCInfo info = default` te da `info.sender` gratis. PurrFlux no lo proporciona. |
-| **Server authority estricta** | `[ServerRpc(RequireOwnership = true)]` + Network Rules garantizan que solo el owner puede invocar. PurrFlux no tiene validación de ownership. |
-| **Comunicación a UN cliente específico** | `[TargetRpc]` envía solo al `PlayerID` target. PurrFlux siempre hace broadcast a todos. |
+| **Server authority estricta con ownership** | `[ServerRpc(RequireOwnership = true)]` + Network Rules garantizan que solo el owner puede invocar. PurrFlux no tiene validación de ownership. |
+| **Comunicación a UN cliente específico** | `[TargetRpc]` envía solo al `PlayerID` target. PurrFlux envía a todos (`serverOnly: false`) o solo al servidor (`serverOnly: true`), no a un cliente específico. |
 | **Rendimiento crítico** (miles de mensajes/seg) | PurrNet usa codegen IL = cero reflection en runtime. PurrFlux usa diccionarios + reflection en suscripción. |
 | **Datos complejos con delta sync** | SyncVar, SyncList, SyncDictionary de PurrNet manejan esto nativamente. |
 | **Genéricos tipados** | Generic RPC de PurrNet mantiene type safety en compilación. PurrFlux pierde type safety al usar strings. |
@@ -211,22 +229,21 @@ Con PurrFlux, `"topic".DispatchNet(data)` funciona desde cualquier contexto cone
 
 ## Caso de Estudio: RequestAddPlayer (el circuito actual)
 
-### Con PurrFlux
+### Con PurrFlux (serverOnly: true)
 ```csharp
 // User.cs — publica sin saber quién escucha
-NetworkService.Messaging.RequestAddPlayer(userId);
-// → internamente: "RequestAddPlayer".DispatchNet(userId);
+"RequestAddPlayer".DispatchNet(userId, serverOnly: true);
 
 // NetworkMessagingModule.cs — escucha por topic
 [MethodPurrFlux(nameof(RequestAddPlayer))]
-private void RequestAddPlayer(ulong userId)
+private void RequestAddPlayer(PlayerID sender, ulong userId)
 {
-    if (!isServer) return;  // Guard MANUAL
+    if (!isServer) return;
     NetworkService.Player.TryAddPlayer(userId);
 }
 ```
 
-**Problema**: PurrFlux hace broadcast a TODOS los clientes. Cada cliente recibe `RequestAddPlayer`, y solo el servidor actúa. Los demás clientes ejecutan `if (!isServer) return;` innecesariamente — es waste de bandwidth y procesamiento.
+Con `serverOnly: true`, el mensaje viaja Client→Server directamente y **no** se rebroadcastea. El guard `if (!isServer)` es redundante pero seguro. Además, `sender` identifica quién hizo la solicitud.
 
 ### Con PurrNet [ServerRpc]
 ```csharp
@@ -244,9 +261,11 @@ private void ServerRpc_RequestAddPlayer(ulong userId, RPCInfo info = default)
 }
 ```
 
-**Ventaja**: El mensaje viaja Client→Server directamente. Ningún otro cliente lo recibe. Más eficiente, más seguro.
+**Ventaja de PurrNet nativo**: Codegen garantiza que el método SOLO se ejecuta en servidor. No hay broadcast innecesario a otros clientes. Ownership validation integrada si se necesita.
 
-**Veredicto para este caso**: PurrNet nativo es mejor. Es un request unidireccional Client→Server que no necesita broadcast.
+**Ventaja de PurrFlux**: Desacoplamiento total — `User.cs` no necesita referencia a `NetworkMessagingModule`. Con `serverOnly: true` el bandwidth es equivalente (no hay broadcast a otros clientes).
+
+**Veredicto para este caso**: PurrNet nativo sigue siendo preferible por las garantías en compilación (codegen). PurrFlux con `serverOnly: true` es una alternativa viable si el desacoplamiento es prioritario.
 
 ---
 
@@ -255,19 +274,19 @@ private void ServerRpc_RequestAddPlayer(ulong userId, RPCInfo info = default)
 ### 1. Chat Global
 ```csharp
 // Desde cualquier parte
-$"chat/{channel}".DispatchNet(new ChatMessage(senderName, text));
+$"chat/{channel}".DispatchNet(new ChatMessage(senderName, text), serverOnly: false);
 
-// Cualquier UI de chat escucha
+// Cualquier UI de chat escucha (con sender info)
 [MethodPurrFlux("chat/global")]
-private void OnGlobalChat(ChatMessage msg) => AppendMessage(msg);
+private void OnGlobalChat(PlayerID sender, ChatMessage msg) => AppendMessage(sender, msg);
 ```
 
 ### 2. Sistema de Eventos del Juego (Game Events)
 ```csharp
 // Servidor notifica a todos sobre eventos del mundo
-"world/weather-changed".DispatchNet("rain");
-"world/boss-spawned".DispatchNet(bossId);
-"world/zone-unlocked".DispatchNet(zoneIndex);
+"world/weather-changed".DispatchNet("rain", serverOnly: false);
+"world/boss-spawned".DispatchNet(bossId, serverOnly: false);
+"world/zone-unlocked".DispatchNet(zoneIndex, serverOnly: false);
 
 // Múltiples módulos independientes reaccionan
 // WeatherVFX, MusicManager, MinimapUI, QuestTracker...
@@ -275,29 +294,49 @@ private void OnGlobalChat(ChatMessage msg) => AppendMessage(msg);
 
 ### 3. Debug/Telemetría en Red
 ```csharp
-// Cualquier cliente puede emitir telemetría
-"debug/performance".DispatchNet(new PerfData(fps, ping, memory));
+// Cualquier cliente puede emitir telemetría (solo al servidor)
+"debug/performance".DispatchNet(new PerfData(fps, ping, memory), serverOnly: true);
 
-// Un módulo de monitoring en el host captura todo
+// Un módulo de monitoring en el host captura todo (con sender info)
 [MethodPurrFlux("debug/performance")]
-private void OnPerfReport(PerfData data) { /* log */ }
+private void OnPerfReport(PlayerID sender, PerfData data) { /* log per-player perf */ }
 ```
 
 ### 4. Sistema de Votación / Encuestas
 ```csharp
-// Cualquier jugador vota
-"vote/kick".DispatchNet(targetPlayerId);
+// Cualquier jugador vota (solo al servidor para validar)
+"vote/kick".DispatchNet(targetPlayerId, serverOnly: true);
 
-// El módulo de votación en todos los clientes actualiza el conteo visual
+// El servidor valida y rebroadcastea el resultado
 [MethodPurrFlux("vote/kick")]
-private void OnVoteReceived(ulong targetId) => UpdateVoteCount(targetId);
+private void OnVoteReceived(PlayerID sender, ulong targetId)
+{
+    if (!isServer) return;
+    RegisterVote(sender, targetId);
+    // Rebroadcast resultado validado
+    "vote/kick-result".DispatchNet(new VoteResult(targetId, currentCount), serverOnly: false);
+}
 ```
 
 ### 5. Sincronización de Estado del Lobby (complementario al matchmaking)
 ```csharp
-"lobby/player-ready".DispatchNet(playerId);
-"lobby/settings-changed".DispatchNet(newSettings);
-"lobby/countdown-started".DispatchNet();
+"lobby/player-ready".DispatchNet(playerId, serverOnly: false);
+"lobby/settings-changed".DispatchNet(newSettings, serverOnly: false);
+"lobby/countdown-started".DispatchNet(serverOnly: false);
+```
+
+### 6. Client→Server Requests Desacoplados
+```csharp
+// Cliente solicita algo al servidor sin necesitar referencia al handler
+"server/craft-item".DispatchNet(itemId, serverOnly: true);
+
+// Servidor procesa con sender info
+[MethodPurrFlux("server/craft-item")]
+private void OnCraftRequest(PlayerID sender, string itemId)
+{
+    if (!isServer) return;
+    ProcessCraft(sender, itemId);
+}
 ```
 
 ---
@@ -305,25 +344,31 @@ private void OnVoteReceived(ulong targetId) => UpdateVoteCount(targetId);
 ## Resumen: Guía de Decisión Rápida
 
 ```
-¿El mensaje necesita ir SOLO al servidor?
+¿El mensaje necesita ir SOLO al servidor con ownership validation?
   → Sí → [ServerRpc]
+
+¿El mensaje necesita ir SOLO al servidor sin ownership validation?
+  → ¿Necesitas respuesta (request-response)?
+    → Sí → Awaitable [ServerRpc] con Task<T>
+    → No → [ServerRpc(RequireOwnership=false)] O PurrFlux con serverOnly: true ✓
 
 ¿El servidor necesita enviar a UN cliente específico?
   → Sí → [TargetRpc]
 
-¿Necesitas esperar una respuesta (request-response)?
-  → Sí → Awaitable [ServerRpc] con Task<T>
-
 ¿Es un evento global donde TODOS deben enterarse?
   → ¿Los listeners son siempre los mismos scripts?
     → Sí → [ObserversRpc]
-    → No (múltiples módulos independientes) → PurrFlux ✓
+    → No (múltiples módulos independientes) → PurrFlux con serverOnly: false ✓
 
 ¿Quieres suscripción dinámica a "canales" por string?
   → PurrFlux ✓
 
 ¿Necesitas mezclar eventos locales + red en el mismo script?
   → PurrFlux ✓ (UniFlux + PurrFlux)
+
+¿Necesitas saber quién envió el mensaje?
+  → PurrNet nativo: RPCInfo info = default
+  → PurrFlux: Action<PlayerID> o Action<PlayerID, T> ✓ (ambos lo soportan)
 
 ¿Performance es crítico (muchos mensajes por segundo)?
   → PurrNet nativo (codegen, zero reflection)
@@ -335,6 +380,8 @@ private void OnVoteReceived(ulong targetId) => UpdateVoteCount(targetId);
 
 PurrFlux **no compite** con PurrNet — lo **complementa** en un nicho específico: **eventos globales desacoplados donde el publisher no conoce a los subscribers**. Es el equivalente de red de un event bus local.
 
-Para comunicación **estructurada** (client→server, server→client, request-response), PurrNet nativo es superior en seguridad, performance y ergonomía.
+Con la adición de `serverOnly` y `PlayerID sender`, PurrFlux cubre más casos de uso que antes: mensajes Client→Server sin broadcast innecesario, e identificación del emisor sin necesidad de RPCInfo.
 
-La combinación ideal es usar **PurrNet nativo para la lógica de juego** y **PurrFlux para eventos observacionales** (notificaciones, logging, UI reactiva, sistemas que solo "escuchan").
+Para comunicación **estructurada** (ownership validation, targeted delivery a un cliente específico, request-response con `Task<T>`), PurrNet nativo es superior en seguridad, performance y ergonomía.
+
+La combinación ideal es usar **PurrNet nativo para la lógica de juego con authority** y **PurrFlux para eventos observacionales y requests desacoplados** (notificaciones, logging, UI reactiva, sistemas que escuchan, telemetría, chat).
